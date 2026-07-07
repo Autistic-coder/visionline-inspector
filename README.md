@@ -43,7 +43,7 @@ VisionLine Inspector is a PySide6 desktop application for running YOLOv8 visual 
 `-- package_runtime.py             # Local packaging helper
 ```
 
-The following are intentionally excluded from GitHub: trained model weights, datasets, videos, images, labels, logs, generated runs, private camera configs, local configs, build folders, dist folders, and executables.
+The following are intentionally excluded from GitHub: datasets, videos, images, labels, logs, generated runs, private camera configs, local configs, build folders, dist folders, and executables.
 
 ## Setup
 
@@ -112,7 +112,7 @@ If a password contains special characters, URL encode it before placing it in th
 
 ## Model Weights
 
-Model weights are intentionally not included in this repository. Provide your own trained YOLO model and point `MODEL_PATH` in `config_app.json` to that file.
+This repository includes the available YOLO model weights for convenience. You can also provide your own trained YOLO model and point `MODEL_PATH` in `config_app.json` to that file.
 
 The app searches common local model locations such as:
 
@@ -122,7 +122,7 @@ models/best_sticker_yolov8.pt
 runs/detect/train/weights/best.pt
 ```
 
-These paths are local-only and matching model files are ignored by Git.
+If you replace or retrain the model, keep any private datasets and generated training runs out of Git.
 
 ## Retraining
 
@@ -134,7 +134,7 @@ python retrain_model.py
 python test_sticker_model.py
 ```
 
-Training data, labels, generated runs, prediction images, and model weights are excluded from GitHub. Review and adapt dataset paths for your own workstation before training.
+Training data, labels, generated runs, and prediction images are excluded from GitHub. Review and adapt dataset paths for your own workstation before training.
 
 ## Debugging And Logs
 
@@ -150,7 +150,6 @@ This repository excludes:
 - credentials and tokens
 - RTSP URLs with real credentials
 - private IP addresses
-- trained model weights
 - datasets, videos, images, and labels
 - logs and debug snapshots
 - `build/`, `dist/`, and `.exe` files

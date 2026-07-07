@@ -17,17 +17,14 @@ ENV/
 build/
 dist/
 *.exe
-*.spec
 installer/
 release/
 
-# Model weights and training outputs
-*.pt
+# Alternate exported model formats and training outputs
 *.onnx
 *.engine
 *.torchscript
 *.tflite
-models/*.pt
 runs/
 
 # Datasets/media
