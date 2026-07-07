@@ -10,6 +10,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass
+from enum import Enum
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
@@ -52,6 +53,7 @@ MODEL_DIR = BASE_DIR / "models"
 CONFIG_PATH = BASE_DIR / "config" / "app_config.json" if getattr(sys, "frozen", False) else BASE_DIR / "config_app.json"
 CAMERA_CONFIG_PATH = BASE_DIR / "camera_config.ini"
 LOG_PATH = BASE_DIR / "logs" / "exe_runtime.log" if getattr(sys, "frozen", False) else BASE_DIR / "app_runtime.log"
+APP_LOG_PATH = BASE_DIR / "logs" / "app.log"
 LIVE_LOG_PATH = BASE_DIR / "logs" / "live_camera.log"
 INSPECTION_CYCLE_LOG_DIR = BASE_DIR / "logs" / "inspection_cycles"
 NG_CASE_LOG_DIR = BASE_DIR / "logs" / "ng_cases"
@@ -146,9 +148,13 @@ logger = logging.getLogger("sticker_app")
 logger.setLevel(logging.INFO)
 if not logger.handlers:
     LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    APP_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     handler = RotatingFileHandler(LOG_PATH, maxBytes=512_000, backupCount=2, encoding="utf-8")
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
     logger.addHandler(handler)
+    app_handler = RotatingFileHandler(APP_LOG_PATH, maxBytes=1_000_000, backupCount=3, encoding="utf-8")
+    app_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logger.addHandler(app_handler)
 
 live_logger = logging.getLogger("sticker_app.live_camera")
 live_logger.setLevel(logging.INFO)
@@ -163,6 +169,15 @@ FINAL_WAITING = "WAITING"
 FINAL_MISSING = "MISSING"
 FINAL_OK = "PLA_CARD_OK"
 FINAL_NG = "PLA_CARD_NG"
+
+
+class AppState(Enum):
+    IDLE = "IDLE"
+    LOADING_MODEL = "LOADING_MODEL"
+    RUNNING_VIDEO = "RUNNING_VIDEO"
+    RUNNING_CAMERA = "RUNNING_CAMERA"
+    STOPPING = "STOPPING"
+    ERROR = "ERROR"
 
 
 def utc_timestamp() -> str:
@@ -1598,48 +1613,57 @@ class LatestFrameCapture:
         frame_interval = 1.0 / self.source_fps
         logger.info("Playback loop started: side=%s thread_alive=%s", self.side, self.thread.is_alive())
         last_progress_log = time.perf_counter()
-        while not self.stop_event.is_set():
-            loop_start = time.perf_counter()
-            ok, frame = self.cap.read()
-            if not ok:
-                current_pos = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES) or 0)
-                self.last_read_error = f"cap.read() returned false at frame {current_pos}"
-                logger.info(
-                    "Read failure: side=%s frame=%s total=%s loop=%s",
-                    self.side,
-                    current_pos,
-                    self.total_frames,
-                    self.loop_video,
-                )
-                if self.loop_video and self.total_frames > 0 and not self.stop_event.is_set():
-                    self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                    continue
-                self.ended = True
-                break
+        try:
+            while not self.stop_event.is_set():
+                loop_start = time.perf_counter()
+                ok, frame = self.cap.read()
+                if not ok:
+                    current_pos = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES) or 0)
+                    self.last_read_error = f"cap.read() returned false at frame {current_pos}"
+                    logger.info(
+                        "Read failure: side=%s frame=%s total=%s loop=%s",
+                        self.side,
+                        current_pos,
+                        self.total_frames,
+                        self.loop_video,
+                    )
+                    if self.loop_video and self.total_frames > 0 and not self.stop_event.is_set():
+                        self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                        continue
+                    self.ended = True
+                    break
+                with self.lock:
+                    self.frame = frame
+                    self.frame_number += 1
+                now = time.perf_counter()
+                if now - last_progress_log >= 3.0:
+                    logger.info(
+                        "Playback progress: side=%s frame_number=%s worker_thread_alive=%s",
+                        self.side,
+                        self.frame_number,
+                        self.thread.is_alive(),
+                    )
+                    last_progress_log = now
+                sleep_time = frame_interval - (time.perf_counter() - loop_start)
+                if sleep_time > 0:
+                    time.sleep(min(sleep_time, frame_interval))
+        except Exception:
+            logger.exception("Playback loop crashed: side=%s", self.side)
+        finally:
+            try:
+                self.cap.release()
+            except Exception:
+                logger.exception("Failed to release video capture: side=%s", self.side)
             with self.lock:
-                self.frame = frame
-                self.frame_number += 1
-            now = time.perf_counter()
-            if now - last_progress_log >= 3.0:
-                logger.info(
-                    "Playback progress: side=%s frame_number=%s worker_thread_alive=%s",
-                    self.side,
-                    self.frame_number,
-                    self.thread.is_alive(),
-                )
-                last_progress_log = now
-            sleep_time = frame_interval - (time.perf_counter() - loop_start)
-            if sleep_time > 0:
-                time.sleep(min(sleep_time, frame_interval))
-        self.cap.release()
-        logger.info(
-            "Playback loop stopped: side=%s frame_number=%s ended=%s stop_requested=%s last_read_error=%s",
-            self.side,
-            self.frame_number,
-            self.ended,
-            self.stop_event.is_set(),
-            self.last_read_error,
-        )
+                self.frame = None
+            logger.info(
+                "Playback loop stopped: side=%s frame_number=%s ended=%s stop_requested=%s last_read_error=%s",
+                self.side,
+                self.frame_number,
+                self.ended,
+                self.stop_event.is_set(),
+                self.last_read_error,
+            )
 
     def latest(self) -> tuple[int, np.ndarray | None]:
         with self.lock:
@@ -1651,6 +1675,9 @@ class LatestFrameCapture:
             self.thread.join(timeout=1.5)
         if self.cap.isOpened():
             self.cap.release()
+        with self.lock:
+            self.frame = None
+        logger.info("Playback resources cleaned: side=%s thread_alive=%s", self.side, self.thread.is_alive())
 
 
 class RTSPCameraWorker:
@@ -1734,7 +1761,7 @@ class RTSPCameraWorker:
             try:
                 self.cap.release()
             except Exception:
-                pass
+                live_logger.exception("%s camera release failed", self.side)
         self.cap = None
 
     def _reader(self) -> None:
@@ -1814,6 +1841,9 @@ class RTSPCameraWorker:
         self._release_capture()
         if self.thread.is_alive():
             self.thread.join(timeout=3.0)
+        with self.lock:
+            self.frame = None
+        live_logger.info("%s camera resources cleaned thread_alive=%s", self.side, self.thread.is_alive())
 
 
 class DualVideoWorker(QThread):
@@ -2427,6 +2457,10 @@ class VideoPanel(QFrame):
 class InspectionWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
+        self.app_state = AppState.LOADING_MODEL
+        self.action_locks: set[str] = set()
+        self.control_buttons: dict[str, list[QPushButton]] = {}
+        self.is_closing = False
         self.config = load_config()
         self.camera_config = load_camera_config()
         self.model_manager = ModelManager(self.config)
@@ -2443,9 +2477,12 @@ class InspectionWindow(QMainWindow):
         self.refresh_static_status()
 
         if self.model_manager.error:
+            self.set_app_state(AppState.ERROR, "model load failed")
             QMessageBox.warning(self, "Model Missing", self.model_manager.error)
-        elif self.camera_config.get("mode") == "live":
-            self.start_live_cameras(auto=True)
+        else:
+            self.set_app_state(AppState.IDLE, "startup complete")
+            if self.camera_config.get("mode") == "live":
+                self.start_live_cameras(auto=True)
 
     def build_ui(self) -> None:
         root = QWidget()
@@ -2541,13 +2578,13 @@ class InspectionWindow(QMainWindow):
         side_column.addWidget(controls)
 
         controls_layout.addWidget(self.section_label("Controls"))
-        self.add_button(controls_layout, "Select Left Video", lambda: self.select_video("left"))
-        self.add_button(controls_layout, "Select Right Video", lambda: self.select_video("right"))
-        self.add_button(controls_layout, "Start", self.start_both)
-        self.add_button(controls_layout, "Stop", self.stop_both)
-        self.add_button(controls_layout, "Start Live Cameras", self.start_live_cameras)
-        self.add_button(controls_layout, "Stop Live Cameras", self.stop_both)
-        self.add_button(controls_layout, "Reset", self.clear_results)
+        self.add_button(controls_layout, "Select Left Video", lambda: self.select_video("left"), "select_video")
+        self.add_button(controls_layout, "Select Right Video", lambda: self.select_video("right"), "select_video")
+        self.add_button(controls_layout, "Start", self.start_both, "start_video")
+        self.add_button(controls_layout, "Stop", self.stop_both, "stop")
+        self.add_button(controls_layout, "Start Live Cameras", self.start_live_cameras, "start_camera")
+        self.add_button(controls_layout, "Stop Live Cameras", self.stop_both, "stop")
+        self.add_button(controls_layout, "Reset", self.clear_results, "reset")
         self.require_both_checkbox = QCheckBox("Require both stickers")
         self.require_both_checkbox.setChecked(bool(self.config.get("REQUIRE_BOTH_STICKERS", False)))
         self.require_both_checkbox.toggled.connect(self.on_require_both_changed)
@@ -2570,10 +2607,88 @@ class InspectionWindow(QMainWindow):
         layout.addWidget(widget, 1)
         return row
 
-    def add_button(self, layout: QVBoxLayout | QHBoxLayout, text: str, callback: Any) -> None:
+    def add_button(self, layout: QVBoxLayout | QHBoxLayout, text: str, callback: Any, action_key: str) -> None:
         button = QPushButton(text)
         button.clicked.connect(callback)
+        self.control_buttons.setdefault(action_key, []).append(button)
         layout.addWidget(button)
+
+    def set_app_state(self, state: AppState, reason: str = "") -> None:
+        previous = getattr(self, "app_state", AppState.IDLE)
+        if previous != state:
+            logger.info("App state transition: %s -> %s reason=%s", previous.value, state.value, reason)
+        self.app_state = state
+        self.update_control_buttons()
+
+    def begin_action(self, action: str) -> bool:
+        if action in self.action_locks:
+            logger.info("Ignored repeated %s click; action already in progress", action)
+            return False
+        self.action_locks.add(action)
+        logger.info("Button action started: %s state=%s", action, self.app_state.value)
+        self.update_control_buttons()
+        return True
+
+    def end_action(self, action: str) -> None:
+        self.action_locks.discard(action)
+        logger.info("Button action finished: %s state=%s", action, self.app_state.value)
+        self.update_control_buttons()
+
+    def worker_running(self) -> bool:
+        return self.worker is not None and self.worker.isRunning()
+
+    def update_control_buttons(self) -> None:
+        if not hasattr(self, "control_buttons"):
+            return
+        busy = bool(self.action_locks) or self.app_state in (AppState.LOADING_MODEL, AppState.STOPPING)
+        running = self.app_state in (AppState.RUNNING_VIDEO, AppState.RUNNING_CAMERA) or self.worker_running()
+        enabled_by_action = {
+            "select_video": not busy and not running,
+            "start_video": not busy and not running and self.model_manager.ready,
+            "start_camera": not busy and not running and self.model_manager.ready,
+            "stop": not busy and running,
+            "reset": not busy and not running,
+        }
+        if self.app_state == AppState.ERROR:
+            enabled_by_action["select_video"] = not busy
+            enabled_by_action["reset"] = not busy
+        for action, buttons in self.control_buttons.items():
+            enabled = enabled_by_action.get(action, not busy)
+            for button in buttons:
+                button.setEnabled(enabled)
+        if hasattr(self, "require_both_checkbox"):
+            self.require_both_checkbox.setEnabled(not busy and not running)
+
+    def show_clean_error(self, title: str, message: str) -> None:
+        logger.error("%s: %s", title, message)
+        self.set_app_state(AppState.ERROR, title)
+        QMessageBox.warning(self, title, message)
+
+    def stop_worker_safely(self, reason: str, wait_ms: int = 3000) -> bool:
+        worker = self.worker
+        if worker is None:
+            logger.info("No worker to stop: %s", reason)
+            return True
+        logger.info("Stopping worker: reason=%s running=%s", reason, worker.isRunning())
+        try:
+            worker.stop()
+            if worker.isRunning() and not worker.wait(wait_ms):
+                logger.warning("Worker did not stop within %sms: reason=%s", wait_ms, reason)
+                return False
+            logger.info("Worker stopped cleanly: reason=%s", reason)
+            return True
+        except Exception:
+            logger.exception("Worker stop failed: reason=%s", reason)
+            return False
+        finally:
+            if not worker.isRunning():
+                self.worker = None
+            if torch.cuda.is_available():
+                try:
+                    torch.cuda.empty_cache()
+                    logger.info("CUDA cache cleanup completed")
+                except Exception:
+                    logger.exception("CUDA cache cleanup failed")
 
     def apply_styles(self) -> None:
         self.setStyleSheet(
@@ -2694,8 +2809,13 @@ class InspectionWindow(QMainWindow):
                 self.status_labels[key].setText("ENABLED" if camera_info.get("enabled") else "DISABLED")
         self.header_status.setText("GPU READY" if "CUDA" in self.model_manager.device_label else "CPU MODE")
         self.update_final_result()
+        self.update_control_buttons()
 
     def on_require_both_changed(self, checked: bool) -> None:
+        if self.app_state in (AppState.RUNNING_VIDEO, AppState.RUNNING_CAMERA, AppState.STOPPING):
+            logger.info("Ignored require-both toggle while state=%s", self.app_state.value)
+            self.require_both_checkbox.setChecked(bool(self.config.get("REQUIRE_BOTH_STICKERS", False)))
+            return
         self.config["REQUIRE_BOTH_STICKERS"] = bool(checked)
         self.current_final_decision = "WAITING"
         self.refresh_static_status()
@@ -2782,37 +2902,72 @@ class InspectionWindow(QMainWindow):
         return True
 
     def select_video(self, side: str) -> None:
-        path, _ = QFileDialog.getOpenFileName(
-            self,
-            f"Select {side.title()} Video",
-            str(BASE_DIR),
-            "Video Files (*.mp4 *.avi *.mov *.mkv *.webm);;All Files (*)",
-        )
-        if not path:
+        action = f"select_video_{side}"
+        if not self.begin_action(action):
             return
-        self.video_paths[side] = str(Path(path).expanduser().resolve())
-        self.side_status[side] = "CHECKING"
-        self.panels[side].video_label.setText("CHECKING VIDEO")
-        self.panels[side].video_label.setPixmap(QPixmap())
-        self.panels[side].status_label.setText("Status: CHECKING VIDEO")
-        self.diagnose_and_preview_video(side)
-        self.refresh_static_status()
+        try:
+            if self.worker_running():
+                self.set_app_state(AppState.STOPPING, f"switching {side} video")
+                if not self.stop_worker_safely(f"switching {side} video"):
+                    self.show_clean_error("Stop Error", "Could not stop the current inspection before changing video.")
+                    return
+                self.set_app_state(AppState.IDLE, "old worker stopped before video selection")
+            path, _ = QFileDialog.getOpenFileName(
+                self,
+                f"Select {side.title()} Video",
+                str(BASE_DIR),
+                "Video Files (*.mp4 *.avi *.mov *.mkv *.webm);;All Files (*)",
+            )
+            if not path:
+                logger.info("Video selection cancelled: side=%s", side)
+                return
+            logger.info("Video selected: side=%s path=%s", side, path)
+            self.video_paths[side] = str(Path(path).expanduser().resolve())
+            self.side_status[side] = "CHECKING"
+            self.panels[side].video_label.setText("CHECKING VIDEO")
+            self.panels[side].video_label.setPixmap(QPixmap())
+            self.panels[side].status_label.setText("Status: CHECKING VIDEO")
+            self.diagnose_and_preview_video(side)
+            self.set_app_state(AppState.IDLE, "video selected")
+            self.refresh_static_status()
+        except Exception as exc:
+            logger.exception("Video selection failed: side=%s", side)
+            self.show_clean_error("Video Error", str(exc))
+        finally:
+            self.end_action(action)
 
     def select_model(self) -> None:
-        self.stop_both()
-        path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Select YOLO Model",
-            str(BASE_DIR),
-            "YOLO Model (*.pt);;All Files (*)",
-        )
-        if not path:
+        if not self.begin_action("select_model"):
             return
-        self.config["MODEL_PATH"] = path
-        self.model_manager.load_model(path)
-        self.refresh_static_status()
-        if self.model_manager.error:
-            QMessageBox.warning(self, "Model Error", self.model_manager.error)
+        try:
+            if self.worker_running():
+                self.set_app_state(AppState.STOPPING, "model switch")
+                if not self.stop_worker_safely("model switch"):
+                    self.show_clean_error("Stop Error", "Could not stop the current inspection before changing model.")
+                    return
+                self.set_app_state(AppState.IDLE, "old worker stopped before model selection")
+            path, _ = QFileDialog.getOpenFileName(
+                self,
+                "Select YOLO Model",
+                str(BASE_DIR),
+                "YOLO Model (*.pt);;All Files (*)",
+            )
+            if not path:
+                logger.info("Model selection cancelled")
+                return
+            self.set_app_state(AppState.LOADING_MODEL, "manual model selection")
+            self.config["MODEL_PATH"] = path
+            self.model_manager.load_model(path)
+            self.refresh_static_status()
+            if self.model_manager.error:
+                self.show_clean_error("Model Error", self.model_manager.error)
+            else:
+                self.set_app_state(AppState.IDLE, "model loaded")
+        except Exception as exc:
+            logger.exception("Model selection failed")
+            self.show_clean_error("Model Error", str(exc))
+        finally:
+            self.end_action("select_model")
 
     def create_worker(
         self,
@@ -2837,128 +2992,175 @@ class InspectionWindow(QMainWindow):
         )
 
     def start_both(self) -> None:
-        if not self.model_manager.ready:
-            QMessageBox.warning(self, "Model Error", self.model_manager.error or "Model is not loaded.")
+        if not self.begin_action("start_video"):
             return
-        if not self.video_paths["left"] and not self.video_paths["right"]:
-            self.side_status = {"left": "NO VIDEO", "right": "NO VIDEO"}
-            self.refresh_static_status()
-            return
-        if self.worker is not None and self.worker.isRunning():
-            return
+        try:
+            if not self.model_manager.ready:
+                QMessageBox.warning(self, "Model Error", self.model_manager.error or "Model is not loaded.")
+                return
+            if self.worker_running():
+                logger.info("Ignored Start click; worker already running state=%s", self.app_state.value)
+                return
+            if not self.video_paths["left"] and not self.video_paths["right"]:
+                self.side_status = {"left": "NO VIDEO", "right": "NO VIDEO"}
+                self.refresh_static_status()
+                return
 
-        self.current_final_decision = "WAITING"
-        valid_video_paths: dict[str, str] = {}
-        for side in ("left", "right"):
-            if self.video_paths[side]:
-                if self.diagnose_and_preview_video(side):
-                    valid_video_paths[side] = self.video_paths[side]
-                else:
-                    logger.warning("Skipping %s video because diagnostics failed", side)
-            else:
-                self.side_status[side] = "NO VIDEO"
-
-        if not valid_video_paths:
+            self.stop_worker_safely("pre-start cleanup")
             self.current_final_decision = "WAITING"
+            valid_video_paths: dict[str, str] = {}
+            for side in ("left", "right"):
+                if self.video_paths[side]:
+                    if self.diagnose_and_preview_video(side):
+                        valid_video_paths[side] = self.video_paths[side]
+                    else:
+                        logger.warning("Skipping %s video because diagnostics failed", side)
+                else:
+                    self.side_status[side] = "NO VIDEO"
+
+            if not valid_video_paths:
+                self.current_final_decision = "WAITING"
+                self.refresh_static_status()
+                return
+
+            self.active_source_mode = "video_test"
+            for side in valid_video_paths:
+                self.side_status[side] = "RUNNING"
+                self.panels[side].status_label.setText("Status: RUNNING")
+
+            self.worker = self.create_worker(valid_video_paths, "video_test")
+            self.worker.frame_ready.connect(self.on_frame_ready)
+            self.worker.status_ready.connect(self.on_status_ready)
+            self.worker.finished_ready.connect(self.on_finished)
+            self.worker.start()
+            self.set_app_state(AppState.RUNNING_VIDEO, "video worker started")
             self.refresh_static_status()
-            return
-
-        self.active_source_mode = "video_test"
-        for side in valid_video_paths:
-            self.side_status[side] = "RUNNING"
-            self.panels[side].status_label.setText("Status: RUNNING")
-
-        self.worker = self.create_worker(valid_video_paths, "video_test")
-        self.worker.frame_ready.connect(self.on_frame_ready)
-        self.worker.status_ready.connect(self.on_status_ready)
-        self.worker.finished_ready.connect(self.on_finished)
-        self.refresh_static_status()
-        self.worker.start()
-        logger.info("Detection started")
+            logger.info("Detection started")
+        except Exception as exc:
+            logger.exception("Video detection start failed")
+            self.stop_worker_safely("start_video exception cleanup")
+            self.show_clean_error("Start Error", str(exc))
+        finally:
+            self.end_action("start_video")
 
     def start_live_cameras(self, auto: bool = False) -> None:
-        if not self.model_manager.ready:
-            if not auto:
-                QMessageBox.warning(self, "Model Error", self.model_manager.error or "Model is not loaded.")
+        if not self.begin_action("start_camera"):
             return
-        if self.worker is not None and self.worker.isRunning():
-            return
+        try:
+            if not self.model_manager.ready:
+                if not auto:
+                    QMessageBox.warning(self, "Model Error", self.model_manager.error or "Model is not loaded.")
+                return
+            if self.worker_running():
+                logger.info("Ignored live camera start; worker already running state=%s", self.app_state.value)
+                return
 
-        self.camera_config = load_camera_config()
-        cameras = self.camera_config.get("cameras", {})
-        live_sources: dict[str, str] = {}
-        for side in ("left", "right"):
-            camera_info = cameras.get(side, {})
-            prefix = "Left" if side == "left" else "Right"
-            if not camera_info.get("enabled", False):
-                self.status_labels[f"{prefix} Cam"].setText("DISABLED")
-                self.side_status[side] = "NO VIDEO"
-                self.panels[side].status_label.setText("Status: CAMERA DISABLED")
-                continue
-            source = str(camera_info.get("source", "")).strip()
-            if not source:
-                self.status_labels[f"{prefix} Cam"].setText("DISCONNECTED")
-                self.side_status[side] = "NO VIDEO"
-                self.panels[side].status_label.setText("Status: CAMERA SOURCE MISSING")
-                continue
-            live_sources[side] = source
-            self.status_labels[f"{prefix} Cam"].setText("CONNECTING")
-            self.status_labels[f"{prefix} FPS"].setText("0.0")
-            self.side_status[side] = "WAITING"
-            self.panels[side].video_label.setText("CONNECTING CAMERA")
-            self.panels[side].video_label.setPixmap(QPixmap())
-            self.panels[side].status_label.setText("Status: CONNECTING CAMERA")
+            self.stop_worker_safely("pre-live-start cleanup")
+            self.camera_config = load_camera_config()
+            cameras = self.camera_config.get("cameras", {})
+            live_sources: dict[str, str] = {}
+            for side in ("left", "right"):
+                camera_info = cameras.get(side, {})
+                prefix = "Left" if side == "left" else "Right"
+                if not camera_info.get("enabled", False):
+                    self.status_labels[f"{prefix} Cam"].setText("DISABLED")
+                    self.side_status[side] = "NO VIDEO"
+                    self.panels[side].status_label.setText("Status: CAMERA DISABLED")
+                    continue
+                source = str(camera_info.get("source", "")).strip()
+                if not source:
+                    self.status_labels[f"{prefix} Cam"].setText("DISCONNECTED")
+                    self.side_status[side] = "NO VIDEO"
+                    self.panels[side].status_label.setText("Status: CAMERA SOURCE MISSING")
+                    continue
+                live_sources[side] = source
+                self.status_labels[f"{prefix} Cam"].setText("CONNECTING")
+                self.status_labels[f"{prefix} FPS"].setText("0.0")
+                self.side_status[side] = "WAITING"
+                self.panels[side].video_label.setText("CONNECTING CAMERA")
+                self.panels[side].video_label.setPixmap(QPixmap())
+                self.panels[side].status_label.setText("Status: CONNECTING CAMERA")
 
-        if not live_sources:
+            if not live_sources:
+                self.current_final_decision = "WAITING"
+                self.active_source_mode = "video_test"
+                self.refresh_static_status()
+                live_logger.warning("Live camera mode requested but no enabled RTSP sources were configured")
+                return
+
+            self.active_source_mode = "live"
             self.current_final_decision = "WAITING"
-            self.active_source_mode = "video_test"
+            self.worker = self.create_worker(live_sources, "live", self.camera_config)
+            self.worker.frame_ready.connect(self.on_frame_ready)
+            self.worker.status_ready.connect(self.on_status_ready)
+            self.worker.finished_ready.connect(self.on_finished)
+            self.worker.start()
+            self.set_app_state(AppState.RUNNING_CAMERA, "live worker started")
             self.refresh_static_status()
-            live_logger.warning("Live camera mode requested but no enabled RTSP sources were configured")
-            return
-
-        self.active_source_mode = "live"
-        self.current_final_decision = "WAITING"
-        self.worker = self.create_worker(live_sources, "live", self.camera_config)
-        self.worker.frame_ready.connect(self.on_frame_ready)
-        self.worker.status_ready.connect(self.on_status_ready)
-        self.worker.finished_ready.connect(self.on_finished)
-        self.refresh_static_status()
-        self.worker.start()
-        live_logger.info("Live camera detection started")
-        logger.info("Live camera detection started")
+            live_logger.info("Live camera detection started")
+            logger.info("Live camera detection started")
+        except Exception as exc:
+            logger.exception("Live camera start failed")
+            self.stop_worker_safely("start_camera exception cleanup")
+            self.show_clean_error("Camera Error", str(exc))
+        finally:
+            self.end_action("start_camera")
 
     def stop_both(self) -> None:
-        if self.worker is not None and self.worker.isRunning():
-            self.worker.stop()
-            self.worker.wait(3000)
-        self.worker = None
-        for side in ("left", "right"):
-            prefix = "Left" if side == "left" else "Right"
-            if self.video_paths[side] or self.active_source_mode == "live":
-                self.side_status[side] = "STOPPED"
-                self.panels[side].status_label.setText("Status: STOPPED")
-                if self.active_source_mode == "live":
-                    self.status_labels[f"{prefix} Cam"].setText("STOPPED")
-        logger.info("Detection stopped")
-        live_logger.info("Detection stopped")
-        self.refresh_static_status()
+        if not self.begin_action("stop"):
+            return
+        previous_state = self.app_state
+        try:
+            self.set_app_state(AppState.STOPPING, "stop requested")
+            stopped = self.stop_worker_safely("stop button")
+            for side in ("left", "right"):
+                prefix = "Left" if side == "left" else "Right"
+                if self.video_paths[side] or previous_state == AppState.RUNNING_CAMERA or self.active_source_mode == "live":
+                    self.side_status[side] = "STOPPED"
+                    self.panels[side].status_label.setText("Status: STOPPED")
+                    if previous_state == AppState.RUNNING_CAMERA or self.active_source_mode == "live":
+                        self.status_labels[f"{prefix} Cam"].setText("STOPPED")
+            self.set_app_state(AppState.IDLE if stopped else AppState.ERROR, "stop completed" if stopped else "worker stop timed out")
+            logger.info("Detection stopped")
+            live_logger.info("Detection stopped")
+            self.refresh_static_status()
+        except Exception:
+            logger.exception("Stop failed")
+            self.set_app_state(AppState.ERROR, "stop failed")
+        finally:
+            self.end_action("stop")
 
     def clear_results(self) -> None:
-        self.current_final_decision = "WAITING"
-        for side in ("left", "right"):
-            self.side_status[side] = "NO VIDEO" if not self.video_paths[side] else "READY"
-            self.panels[side].video_label.setPixmap(QPixmap())
-            self.panels[side].video_label.setText("READY" if self.video_paths[side] else "NO VIDEO")
-            self.panels[side].status_label.setText(f"Status: {self.side_status[side]}")
-            prefix = "Left" if side == "left" else "Right"
-            camera_info = self.camera_config.get("cameras", {}).get(side, {})
-            self.status_labels[f"{prefix} Cam"].setText("ENABLED" if camera_info.get("enabled") else "DISABLED")
-        for key in self.status_labels:
-            if key not in ("Model", "Device", "Left", "Right", "Mode", "Left Cam", "Right Cam"):
-                self.status_labels[key].setText("-")
-        self.refresh_static_status()
+        if not self.begin_action("reset"):
+            return
+        try:
+            if self.worker_running():
+                logger.info("Ignored reset while worker is running")
+                return
+            self.current_final_decision = "WAITING"
+            for side in ("left", "right"):
+                self.side_status[side] = "NO VIDEO" if not self.video_paths[side] else "READY"
+                self.panels[side].video_label.setPixmap(QPixmap())
+                self.panels[side].video_label.setText("READY" if self.video_paths[side] else "NO VIDEO")
+                self.panels[side].status_label.setText(f"Status: {self.side_status[side]}")
+                prefix = "Left" if side == "left" else "Right"
+                camera_info = self.camera_config.get("cameras", {}).get(side, {})
+                self.status_labels[f"{prefix} Cam"].setText("ENABLED" if camera_info.get("enabled") else "DISABLED")
+            for key in self.status_labels:
+                if key not in ("Model", "Device", "Left", "Right", "Mode", "Left Cam", "Right Cam"):
+                    self.status_labels[key].setText("-")
+            self.set_app_state(AppState.IDLE, "reset completed")
+            self.refresh_static_status()
+        except Exception:
+            logger.exception("Reset failed")
+            self.set_app_state(AppState.ERROR, "reset failed")
+        finally:
+            self.end_action("reset")
 
     def on_frame_ready(self, side: str, image: QImage, metadata: dict) -> None:
+        if self.app_state not in (AppState.RUNNING_VIDEO, AppState.RUNNING_CAMERA):
+            logger.debug("Ignored stale frame signal: side=%s state=%s", side, self.app_state.value)
+            return
         try:
             panel = self.panels[side]
             pixmap = QPixmap.fromImage(image)
@@ -3004,6 +3206,9 @@ class InspectionWindow(QMainWindow):
         self.update_final_result()
 
     def on_status_ready(self, side: str, metadata: dict) -> None:
+        if self.app_state == AppState.IDLE and self.worker is None:
+            logger.debug("Ignored stale status signal: side=%s metadata=%s", side, metadata)
+            return
         prefix = "Left" if side == "left" else "Right"
         if metadata.get("camera_health"):
             camera_status = str(metadata.get("camera_status", "DISCONNECTED"))
@@ -3032,6 +3237,7 @@ class InspectionWindow(QMainWindow):
         self.refresh_static_status()
 
     def on_finished(self, metadata: dict) -> None:
+        logger.info("Worker finished signal received: metadata=%s state=%s", metadata, self.app_state.value)
         finished_mode = self.active_source_mode
         self.worker = None
         if metadata.get("status") == "ENDED":
@@ -3041,7 +3247,10 @@ class InspectionWindow(QMainWindow):
         elif finished_mode == "live":
             for side in ("left", "right"):
                 self.status_labels[f"{'Left' if side == 'left' else 'Right'} Cam"].setText("STOPPED")
+        if not self.is_closing and self.app_state in (AppState.RUNNING_VIDEO, AppState.RUNNING_CAMERA, AppState.STOPPING):
+            self.set_app_state(AppState.IDLE, "worker finished")
         self.update_final_result()
+        self.update_control_buttons()
 
     def update_final_result(self) -> None:
         result = self.current_final_decision
@@ -3065,11 +3274,24 @@ class InspectionWindow(QMainWindow):
         self.final_result.setStyleSheet(f"background: {color}; color: {text_color};")
 
     def closeEvent(self, event: QCloseEvent) -> None:
-        self.stop_both()
-        if self.model_manager.model_path:
-            self.config["MODEL_PATH"] = config_model_path_value(self.model_manager.model_path)
-        save_config(self.config)
-        event.accept()
+        logger.info("Application close requested")
+        self.is_closing = True
+        try:
+            self.set_app_state(AppState.STOPPING, "application close")
+            self.stop_worker_safely("application close", wait_ms=4000)
+            if self.model_manager.model_path:
+                self.config["MODEL_PATH"] = config_model_path_value(self.model_manager.model_path)
+            save_config(self.config)
+            logger.info("Application cleanup complete")
+        except Exception:
+            logger.exception("Application close cleanup failed")
+        finally:
+            for handler in logger.handlers:
+                try:
+                    handler.flush()
+                except Exception:
+                    pass
+            event.accept()
 
 
 def main() -> int:
