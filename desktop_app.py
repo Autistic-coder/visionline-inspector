@@ -2690,6 +2690,33 @@ class InspectionWindow(QMainWindow):
                 except Exception:
                     logger.exception("CUDA cache cleanup failed")
 
+    def connect_worker_signals(self, worker: DualVideoWorker) -> None:
+        worker.frame_ready.connect(
+            lambda side, image, metadata, source_worker=worker: self.on_frame_ready(
+                source_worker,
+                side,
+                image,
+                metadata,
+            )
+        )
+        worker.status_ready.connect(
+            lambda side, metadata, source_worker=worker: self.on_status_ready(source_worker, side, metadata)
+        )
+        worker.finished_ready.connect(
+            lambda metadata, source_worker=worker: self.on_finished(source_worker, metadata)
+        )
+
+    def is_current_worker_signal(self, worker: DualVideoWorker, signal_name: str) -> bool:
+        if worker is self.worker:
+            return True
+        logger.info(
+            "Ignored stale %s signal from inactive worker: active_worker=%s signal_worker=%s",
+            signal_name,
+            id(self.worker) if self.worker is not None else None,
+            id(worker),
+        )
+        return False
+
     def apply_styles(self) -> None:
         self.setStyleSheet(
             """
@@ -3029,9 +3056,7 @@ class InspectionWindow(QMainWindow):
                 self.panels[side].status_label.setText("Status: RUNNING")
 
             self.worker = self.create_worker(valid_video_paths, "video_test")
-            self.worker.frame_ready.connect(self.on_frame_ready)
-            self.worker.status_ready.connect(self.on_status_ready)
-            self.worker.finished_ready.connect(self.on_finished)
+            self.connect_worker_signals(self.worker)
             self.worker.start()
             self.set_app_state(AppState.RUNNING_VIDEO, "video worker started")
             self.refresh_static_status()
@@ -3091,9 +3116,7 @@ class InspectionWindow(QMainWindow):
             self.active_source_mode = "live"
             self.current_final_decision = "WAITING"
             self.worker = self.create_worker(live_sources, "live", self.camera_config)
-            self.worker.frame_ready.connect(self.on_frame_ready)
-            self.worker.status_ready.connect(self.on_status_ready)
-            self.worker.finished_ready.connect(self.on_finished)
+            self.connect_worker_signals(self.worker)
             self.worker.start()
             self.set_app_state(AppState.RUNNING_CAMERA, "live worker started")
             self.refresh_static_status()
@@ -3157,7 +3180,9 @@ class InspectionWindow(QMainWindow):
         finally:
             self.end_action("reset")
 
-    def on_frame_ready(self, side: str, image: QImage, metadata: dict) -> None:
+    def on_frame_ready(self, worker: DualVideoWorker, side: str, image: QImage, metadata: dict) -> None:
+        if not self.is_current_worker_signal(worker, "frame_ready"):
+            return
         if self.app_state not in (AppState.RUNNING_VIDEO, AppState.RUNNING_CAMERA):
             logger.debug("Ignored stale frame signal: side=%s state=%s", side, self.app_state.value)
             return
@@ -3205,7 +3230,9 @@ class InspectionWindow(QMainWindow):
         self.status_labels[prefix].setText(status)
         self.update_final_result()
 
-    def on_status_ready(self, side: str, metadata: dict) -> None:
+    def on_status_ready(self, worker: DualVideoWorker, side: str, metadata: dict) -> None:
+        if not self.is_current_worker_signal(worker, "status_ready"):
+            return
         if self.app_state == AppState.IDLE and self.worker is None:
             logger.debug("Ignored stale status signal: side=%s metadata=%s", side, metadata)
             return
@@ -3236,7 +3263,9 @@ class InspectionWindow(QMainWindow):
             self.panels[side].video_label.setText(error)
         self.refresh_static_status()
 
-    def on_finished(self, metadata: dict) -> None:
+    def on_finished(self, worker: DualVideoWorker, metadata: dict) -> None:
+        if not self.is_current_worker_signal(worker, "finished_ready"):
+            return
         logger.info("Worker finished signal received: metadata=%s state=%s", metadata, self.app_state.value)
         finished_mode = self.active_source_mode
         self.worker = None
